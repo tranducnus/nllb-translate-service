@@ -1,245 +1,168 @@
 """
-NLLB-200 Translation API
-CPU-optimized service using CTranslate2 int8 quantization.
-Runs on Hetzner AX41 (AMD Ryzen 5 3600, 64GB RAM, no GPU).
+NLLB-200 Batch Translation API — CTranslate2 with full CPU thread utilization.
 
-Model: facebook/nllb-200-distilled-600M (CTranslate2 int8)
-~350MB RAM footprint, ~0.5-2s per sentence on CPU.
+Endpoints:
+  GET  /health                      — health check
+  POST /translate                   — single text translation
+  POST /translate/batch             — batch translation (50+ sentences at once)
+  GET  /languages                   — list supported language codes
+
+CTranslate2 config:
+  inter_threads=4  — number of parallel translations
+  intra_threads=3  — threads per translation (4×3 = 12 = all Ryzen 3600 threads)
+  compute_type=int8 — 4x faster than float32 on CPU
 """
 
 import os
 import time
 import ctranslate2
-import transformers
+import sentencepiece as spm
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI(
-    title="NLLB-200 Translation API",
-    description="Self-hosted translation service using Meta's NLLB-200 (600M distilled, int8)",
-    version="1.0.0",
-)
+app = FastAPI(title="NLLB-200 Batch API", version="1.0.0")
 
-MODEL_DIR = os.environ.get("NLLB_MODEL_DIR", "/app/model")
-INTER_THREADS = int(os.environ.get("NLLB_INTER_THREADS", "4"))
-INTRA_THREADS = int(os.environ.get("NLLB_INTRA_THREADS", "2"))
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/model")
+INTER_THREADS = int(os.environ.get("INTER_THREADS", "4"))
+INTRA_THREADS = int(os.environ.get("INTRA_THREADS", "3"))
+COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8")
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "128"))
 
 translator = None
-tokenizer = None
-
-
-# ============================================================================
-# NLLB-200 language codes (FLORES-200 format)
-# Maps ISO 639-1 shortcodes to NLLB's internal codes for the 20 most popular
-# languages by global internet usage / news readership.
-# ============================================================================
-LANG_CODE_MAP = {
-    "en": "eng_Latn",
-    "zh": "zho_Hans",    # Simplified Chinese
-    "es": "spa_Latn",
-    "ar": "arb_Arab",    # Modern Standard Arabic
-    "hi": "hin_Deva",
-    "pt": "por_Latn",    # Brazilian Portuguese
-    "fr": "fra_Latn",
-    "de": "deu_Latn",
-    "ja": "jpn_Jpan",
-    "ko": "kor_Hang",
-    "ru": "rus_Cyrl",
-    "it": "ita_Latn",
-    "nl": "nld_Latn",
-    "tr": "tur_Latn",
-    "pl": "pol_Latn",
-    "vi": "vie_Latn",
-    "th": "tha_Thai",
-    "id": "ind_Latn",    # Indonesian
-    "sv": "swe_Latn",
-    "uk": "ukr_Cyrl",
-    "ms": "zsm_Latn",    # Malay (Standard)
-}
-
-
-def resolve_lang_code(code: str) -> str:
-    """Resolve ISO 639-1 or FLORES-200 code to NLLB internal format."""
-    if code in LANG_CODE_MAP:
-        return LANG_CODE_MAP[code]
-    if "_" in code and len(code) == 8:
-        return code
-    raise ValueError(
-        f"Unknown language code: {code}. "
-        f"Use ISO 639-1 ({', '.join(LANG_CODE_MAP.keys())}) or FLORES-200 format (e.g. eng_Latn)."
-    )
+sp_model = None
 
 
 @app.on_event("startup")
 def load_model():
-    global translator, tokenizer
+    global translator, sp_model
+    print(f"Loading CTranslate2 model from {MODEL_DIR}")
+    print(f"  inter_threads={INTER_THREADS}, intra_threads={INTRA_THREADS}, compute_type={COMPUTE_TYPE}")
+    t0 = time.time()
     translator = ctranslate2.Translator(
         MODEL_DIR,
         device="cpu",
-        compute_type="int8",
         inter_threads=INTER_THREADS,
         intra_threads=INTRA_THREADS,
+        compute_type=COMPUTE_TYPE,
     )
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        MODEL_DIR, src_lang="eng_Latn"
-    )
+    sp_model = spm.SentencePieceProcessor()
+    sp_model.Load(os.path.join(MODEL_DIR, "sentencepiece.bpe.model"))
+    elapsed = time.time() - t0
+    print(f"  Model loaded in {elapsed:.1f}s")
 
 
-# ============================================================================
-# Request / Response models
-# ============================================================================
-
-class TranslateRequest(BaseModel):
-    text: str | list[str] = Field(..., description="Text or list of texts to translate")
-    source: str = Field("en", description="Source language (ISO 639-1 or FLORES-200)")
-    target: str = Field(..., description="Target language (ISO 639-1 or FLORES-200)")
-    beam_size: int = Field(4, ge=1, le=10)
-    max_length: int = Field(512, ge=1, le=2048)
+def tokenize(text: str, src_lang: str) -> list[str]:
+    sp_model.SetEncodeExtraOptions("")
+    tokens = sp_model.Encode(text, out_type=str)
+    return [src_lang] + tokens
 
 
-class TranslateResponse(BaseModel):
-    translations: list[str]
-    source: str
-    target: str
-    elapsed_ms: float
+def detokenize(tokens: list[str]) -> str:
+    filtered = [t for t in tokens if not t.startswith("__") or not t.endswith("__")]
+    return sp_model.Decode(filtered)
 
 
-class BatchTranslateRequest(BaseModel):
-    texts: list[str] = Field(..., description="List of texts to translate", max_length=100)
-    source: str = Field("en", description="Source language")
-    target: str = Field(..., description="Target language")
-    beam_size: int = Field(4, ge=1, le=10)
-    max_length: int = Field(512, ge=1, le=2048)
+def translate_texts(texts: list[str], source: str, target: str, beam_size: int = 4) -> list[dict]:
+    source_tokens = [tokenize(t, source) for t in texts]
+    target_prefix = [[target]] * len(texts)
 
-
-class BatchTranslateResponse(BaseModel):
-    translations: list[str]
-    source: str
-    target: str
-    count: int
-    elapsed_ms: float
-
-
-class LanguageInfo(BaseModel):
-    iso_code: str
-    nllb_code: str
-    name: str
-
-
-LANGUAGE_NAMES = {
-    "en": "English", "zh": "Chinese", "es": "Spanish", "ar": "Arabic",
-    "hi": "Hindi", "pt": "Portuguese", "fr": "French", "de": "German",
-    "ja": "Japanese", "ko": "Korean", "ru": "Russian", "it": "Italian",
-    "nl": "Dutch", "tr": "Turkish", "pl": "Polish", "vi": "Vietnamese",
-    "th": "Thai", "id": "Indonesian", "sv": "Swedish", "uk": "Ukrainian",
-    "ms": "Malay",
-}
-
-
-# ============================================================================
-# Core translation function
-# ============================================================================
-
-def translate_texts(
-    texts: list[str],
-    src_lang: str,
-    tgt_lang: str,
-    beam_size: int = 4,
-    max_length: int = 512,
-) -> list[str]:
-    src_code = resolve_lang_code(src_lang)
-    tgt_code = resolve_lang_code(tgt_lang)
-
-    tokenizer.src_lang = src_code
-
-    all_tokens = []
-    for text in texts:
-        tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-        all_tokens.append(tokens)
-
+    t0 = time.time()
     results = translator.translate_batch(
-        all_tokens,
-        target_prefix=[[tgt_code]] * len(all_tokens),
+        source_tokens,
+        target_prefix=target_prefix,
         beam_size=beam_size,
-        max_decoding_length=max_length,
-        repetition_penalty=1.2,
+        max_decoding_length=512,
+        replace_unknowns=True,
     )
+    elapsed_ms = (time.time() - t0) * 1000
 
-    translated = []
-    for result in results:
-        output_tokens = result.hypotheses[0]
-        if tgt_code in output_tokens:
-            output_tokens = [t for t in output_tokens if t != tgt_code]
-        decoded = tokenizer.decode(tokenizer.convert_tokens_to_ids(output_tokens))
-        translated.append(decoded)
+    translations = []
+    for r in results:
+        tokens = r.hypotheses[0]
+        text = detokenize(tokens)
+        translations.append(text)
 
-    return translated
+    return translations, elapsed_ms
 
 
-# ============================================================================
-# Endpoints
-# ============================================================================
+class SingleRequest(BaseModel):
+    text: str
+    source: str = "eng_Latn"
+    target: str = "spa_Latn"
+    beam_size: int = 4
+
+
+class BatchRequest(BaseModel):
+    texts: list[str]
+    source: str = "eng_Latn"
+    target: str = "spa_Latn"
+    beam_size: int = 4
+
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "model": "nllb-200-distilled-600M-ct2-int8",
-        "device": "cpu",
+        "status": "healthy",
+        "model": MODEL_DIR,
+        "inter_threads": INTER_THREADS,
+        "intra_threads": INTRA_THREADS,
+        "compute_type": COMPUTE_TYPE,
     }
 
 
-@app.get("/languages", response_model=list[LanguageInfo])
-def list_languages():
-    return [
-        LanguageInfo(iso_code=iso, nllb_code=nllb, name=LANGUAGE_NAMES.get(iso, iso))
-        for iso, nllb in LANG_CODE_MAP.items()
+@app.post("/translate")
+def translate_single(req: SingleRequest):
+    try:
+        translations, elapsed_ms = translate_texts([req.text], req.source, req.target, req.beam_size)
+        return {
+            "translations": translations,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/translate/batch")
+def translate_batch(req: BatchRequest):
+    if len(req.texts) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=400, detail=f"Max batch size is {MAX_BATCH_SIZE}")
+    if len(req.texts) == 0:
+        return {"translations": [], "count": 0, "elapsed_ms": 0}
+    try:
+        translations, elapsed_ms = translate_texts(req.texts, req.source, req.target, req.beam_size)
+        return {
+            "translations": translations,
+            "count": len(translations),
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/languages")
+def languages():
+    common = [
+        {"code": "eng_Latn", "name": "English"},
+        {"code": "zho_Hans", "name": "Chinese (Simplified)"},
+        {"code": "spa_Latn", "name": "Spanish"},
+        {"code": "arb_Arab", "name": "Arabic"},
+        {"code": "hin_Deva", "name": "Hindi"},
+        {"code": "por_Latn", "name": "Portuguese"},
+        {"code": "fra_Latn", "name": "French"},
+        {"code": "deu_Latn", "name": "German"},
+        {"code": "jpn_Jpan", "name": "Japanese"},
+        {"code": "kor_Hang", "name": "Korean"},
+        {"code": "rus_Cyrl", "name": "Russian"},
+        {"code": "ita_Latn", "name": "Italian"},
+        {"code": "nld_Latn", "name": "Dutch"},
+        {"code": "tur_Latn", "name": "Turkish"},
+        {"code": "pol_Latn", "name": "Polish"},
+        {"code": "vie_Latn", "name": "Vietnamese"},
+        {"code": "tha_Thai", "name": "Thai"},
+        {"code": "ind_Latn", "name": "Indonesian"},
+        {"code": "swe_Latn", "name": "Swedish"},
+        {"code": "ukr_Cyrl", "name": "Ukrainian"},
+        {"code": "zsm_Latn", "name": "Malay"},
     ]
-
-
-@app.post("/translate", response_model=TranslateResponse)
-def translate(req: TranslateRequest):
-    texts = req.text if isinstance(req.text, list) else [req.text]
-    if not texts:
-        raise HTTPException(status_code=400, detail="No text provided")
-
-    start = time.monotonic()
-    try:
-        translations = translate_texts(texts, req.source, req.target, req.beam_size, req.max_length)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
-    elapsed_ms = (time.monotonic() - start) * 1000
-
-    return TranslateResponse(
-        translations=translations,
-        source=req.source,
-        target=req.target,
-        elapsed_ms=round(elapsed_ms, 1),
-    )
-
-
-@app.post("/translate/batch", response_model=BatchTranslateResponse)
-def translate_batch(req: BatchTranslateRequest):
-    if not req.texts:
-        raise HTTPException(status_code=400, detail="No texts provided")
-    if len(req.texts) > 100:
-        raise HTTPException(status_code=400, detail="Max 100 texts per batch")
-
-    start = time.monotonic()
-    try:
-        translations = translate_texts(req.texts, req.source, req.target, req.beam_size, req.max_length)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
-    elapsed_ms = (time.monotonic() - start) * 1000
-
-    return BatchTranslateResponse(
-        translations=translations,
-        source=req.source,
-        target=req.target,
-        count=len(translations),
-        elapsed_ms=round(elapsed_ms, 1),
-    )
+    return common
