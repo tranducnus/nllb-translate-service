@@ -65,6 +65,7 @@ def do_translate(texts: list[str], source: str, target: str, beam_size: int = 4)
     translations = []
     for r in results:
         hyp = r.hypotheses[0][1:]
+        hyp = [t for t in hyp if t != "</s>"]
         text = tokenizer.decode(tokenizer.convert_tokens_to_ids(hyp))
         translations.append(text)
 
